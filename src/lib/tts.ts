@@ -5,6 +5,7 @@ import {
   TTS_ENGINE,
   KOKORO_VOICE,
   BRIDGE_HTTP_URL,
+  SPEECH_LOCALE,
 } from '../config'
 import * as kokoro from './kokoro'
 import { caps } from './capabilities'
@@ -19,7 +20,7 @@ import { caps } from './capabilities'
  * conversation that gap is much more noticeable than the timbre.
  *
  * Either way, text is cut at sentence boundaries as it streams in and spoken a
- * sentence at a time, so JARVIS starts talking while Claude is still writing.
+ * sentence at a time, so JARVIS starts talking while Gemini is still writing.
  *
  * The queue is an explicit array with a single pump rather than a promise
  * chain. A chain cannot be cut: cancelling mid-sentence left the chain's tail
@@ -210,8 +211,13 @@ const USABLE = 40
 
 /** Best-first list of usable voices — also what the voice picker cycles. */
 export function candidateVoices(): SpeechSynthesisVoice[] {
-  return speechSynthesis
-    .getVoices()
+  const voices = speechSynthesis.getVoices()
+  const portuguese = voices.filter((v) => /^pt[-_]br/i.test(v.lang))
+  if (portuguese.length) return portuguese
+  const otherPortuguese = voices.filter((v) => /^pt[-_]/i.test(v.lang))
+  if (otherPortuguese.length) return otherPortuguese
+
+  return voices
     .filter((v) => /^en/i.test(v.lang))
     .map((v) => ({ v, s: score(v) }))
     .filter((x) => x.s >= USABLE)
@@ -236,7 +242,11 @@ function pickVoice(): SpeechSynthesisVoice | null {
     localStorage.removeItem(VOICE_PREF_KEY)
   }
 
-  cachedVoice = candidateVoices()[0] ?? all.find((v) => /^en/i.test(v.lang)) ?? null
+  cachedVoice =
+    candidateVoices()[0] ??
+    all.find((v) => /^pt/i.test(v.lang)) ??
+    all.find((v) => /^en/i.test(v.lang)) ??
+    null
   return cachedVoice
 }
 
@@ -477,7 +487,7 @@ export function createSpeaker(): Speaker {
       const u = new SpeechSynthesisUtterance(text)
       const voice = pickVoice()
       if (voice) u.voice = voice
-      u.lang = voice?.lang ?? 'en-GB'
+      u.lang = voice && /^pt/i.test(voice.lang) ? voice.lang : SPEECH_LOCALE
       // Deliberate, and deliberately invariant — the character's pace does not
       // change with stakes, and that steadiness is most of the effect. This
       // lands around 130 wpm, below the median for film dialogue.

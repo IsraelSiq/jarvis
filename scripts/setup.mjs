@@ -6,10 +6,10 @@
 // JARVIS. Every check degrades to a single friendly line if something is not
 // there, and the script always exits 0 — it is advice, not a gate.
 
-import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { loadEnv } from 'vite';
 
 const tick = '  ok  ';
 const warn = ' note ';
@@ -35,29 +35,47 @@ try {
   line(warn, 'Could not read the Node.js version. JARVIS needs Node 20 or newer.');
 }
 
-// --- Claude CLI on PATH ---------------------------------------------------
-let claudeFound = false;
-try {
-  const res = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 10000 });
-  if (res.status === 0 && res.stdout) {
-    claudeFound = true;
-    line(tick, `Claude CLI found: ${res.stdout.trim()}`);
+const localEnv = loadEnv('development', process.cwd(), '');
+const provider = (process.env.JARVIS_PROVIDER || localEnv.JARVIS_PROVIDER || 'gemini').trim().toLowerCase();
+if (provider === 'ollama') {
+  const model = process.env.JARVIS_MODEL || localEnv.JARVIS_MODEL || 'qwen3:4b';
+  try {
+    const response = await fetch('http://localhost:11434/api/tags', {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const installed = (data.models ?? []).some((entry) => entry.name === model);
+    if (installed) {
+      line(tick, `Ollama is running and ${model} is installed.`);
+    } else {
+      line(warn, `Ollama is running, but ${model} is not installed.`);
+      line(info, `Run: ollama pull ${model}`);
+    }
+  } catch {
+    line(warn, 'Ollama is selected but its local API is not responding.');
+    line(info, 'Install and open Ollama, then run: ollama pull ' + model);
   }
-} catch {
-  // ignore — handled below
-}
-if (!claudeFound) {
-  line(warn, 'Claude CLI not found on your PATH.');
-  line(info, 'Install it: npm install -g @anthropic-ai/claude-code');
-  line(info, '  (or the platform installer at https://docs.claude.com/en/docs/claude-code)');
-  line(info, 'Then run `claude` once and complete login. The bridge uses that login — no API key needed.');
+} else if (provider === 'gemini') {
+  const bridgeGeminiKey = process.env.GEMINI_API_KEY || localEnv.GEMINI_API_KEY;
+  if (bridgeGeminiKey && bridgeGeminiKey.trim()) {
+    line(tick, 'Gemini API key found for the bridge.');
+  } else if (localEnv.VITE_GEMINI_API_KEY && localEnv.VITE_GEMINI_API_KEY.trim()) {
+    line(info, 'VITE_GEMINI_API_KEY found for direct mode; bridge mode still needs GEMINI_API_KEY.');
+  } else {
+    line(warn, 'GEMINI_API_KEY is not set. Gemini bridge mode needs an API key.');
+    line(info, 'Create one at https://aistudio.google.com/apikey and set GEMINI_API_KEY, or select JARVIS_PROVIDER=ollama.');
+    line(info, 'For direct mode, set VITE_GEMINI_API_KEY in .env.local instead (it is exposed in the browser).');
+  }
+} else {
+  line(warn, `Unknown JARVIS_PROVIDER "${provider}". Use gemini or ollama.`);
 }
 
-// --- ~/.claude.json and MCP servers --------------------------------------
-const claudeJsonPath = join(homedir(), '.claude.json');
+// --- Gemini CLI MCP servers ----------------------------------------------
+const geminiSettingsPath = join(homedir(), '.gemini', 'settings.json');
 let mcpCount = 0;
 try {
-  const raw = readFileSync(claudeJsonPath, 'utf8');
+  const raw = readFileSync(geminiSettingsPath, 'utf8');
   let parsed = {};
   try {
     parsed = JSON.parse(raw);
@@ -67,12 +85,12 @@ try {
   const servers = parsed && typeof parsed.mcpServers === 'object' && parsed.mcpServers ? parsed.mcpServers : {};
   mcpCount = Object.keys(servers).length;
   if (mcpCount > 0) {
-    line(tick, `~/.claude.json found with ${mcpCount} MCP server${mcpCount === 1 ? '' : 's'} configured.`);
+    line(tick, `~/.gemini/settings.json found with ${mcpCount} MCP server${mcpCount === 1 ? '' : 's'} configured.`);
   } else {
-    line(info, '~/.claude.json found, but no MCP servers are configured yet. JARVIS still answers and drives its own interface.');
+    line(info, '~/.gemini/settings.json found, but no MCP servers are configured yet. JARVIS still answers and drives its own interface.');
   }
 } catch {
-  line(info, '~/.claude.json not found yet. It appears once you run `claude` and log in. JARVIS works without any MCP servers.');
+  line(info, '~/.gemini/settings.json not found. JARVIS works without extra MCP servers.');
 }
 
 // --- ElevenLabs key (env or the elevenlabs MCP entry) --------------------
@@ -81,13 +99,13 @@ function findElevenLabsKey() {
     return 'environment (ELEVENLABS_API_KEY)';
   }
   try {
-    const raw = readFileSync(claudeJsonPath, 'utf8');
+    const raw = readFileSync(geminiSettingsPath, 'utf8');
     const parsed = JSON.parse(raw);
     const servers = parsed && parsed.mcpServers ? parsed.mcpServers : {};
     const el = servers.elevenlabs;
     const env = el && el.env ? el.env : {};
     if (env.ELEVENLABS_API_KEY && String(env.ELEVENLABS_API_KEY).trim()) {
-      return 'the elevenlabs MCP server in ~/.claude.json';
+      return 'the elevenlabs MCP server in ~/.gemini/settings.json';
     }
   } catch {
     // ignore — no key discoverable
@@ -106,7 +124,9 @@ if (elSource) {
 // --- How to run ----------------------------------------------------------
 console.log('');
 console.log('To run JARVIS, open two terminals:');
-console.log('  1)  npm run bridge      # the brain (Claude Code, headless)');
+console.log(
+  `  1)  npm run bridge      # the ${provider === 'ollama' ? 'local Ollama brain' : 'Gemini brain'} and MCP tools`,
+);
 console.log('  2)  npm run dev         # the face (open http://localhost:5173 in Chrome)');
 console.log('');
 console.log('Then click INITIALISE and say "Hey Jarvis".');

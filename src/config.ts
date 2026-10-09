@@ -49,14 +49,13 @@ function flag(name: string, raw: unknown, fallback: boolean): boolean {
 /**
  * Which brain to use.
  *
- *   'bridge' — run `npm run bridge` alongside the app. Authenticates off your
- *              existing Claude Code login (no API key), and every MCP server in
- *              your Claude Code config is available to JARVIS, including local
- *              ones like higgsfield, elevenlabs, android and playwright.
+ *   'bridge' — run `npm run bridge` alongside the app. Uses GEMINI_API_KEY on
+ *              the local server and makes configured local and remote MCP
+ *              servers available to JARVIS.
  *
- *   'direct' — the browser calls the Claude API itself. Nothing to run and it
- *              deploys as a static site, but it needs VITE_ANTHROPIC_API_KEY in
- *              the bundle and only reaches remote HTTP MCP servers.
+ *   'direct' — the browser calls the Gemini API itself. Nothing to run and it
+ *              deploys as a static site, but VITE_GEMINI_API_KEY is exposed in
+ *              the browser bundle; only remote HTTP MCP servers are available.
  */
 export const BACKEND: 'bridge' | 'direct' = choice(
   'VITE_BACKEND',
@@ -64,6 +63,8 @@ export const BACKEND: 'bridge' | 'direct' = choice(
   ['bridge', 'direct'] as const,
   'bridge',
 )
+
+export const SPEECH_LOCALE = 'pt-BR'
 
 /**
  * Where the bridge lives. Derived once here rather than in each of the three
@@ -129,23 +130,14 @@ export const KOKORO_VOICE = choice(
 )
 
 export const env = {
-  anthropicKey: str(import.meta.env.VITE_ANTHROPIC_API_KEY) ?? '',
+  geminiKey: str(import.meta.env.VITE_GEMINI_API_KEY) ?? '',
   elevenKey: str(import.meta.env.VITE_ELEVENLABS_API_KEY) ?? '',
   elevenVoiceId:
     str(import.meta.env.VITE_ELEVENLABS_VOICE_ID) ?? 'JBFqnCBsd6RMkjVDRZzb',
   porcupineKey: str(import.meta.env.VITE_PICOVOICE_ACCESS_KEY) ?? '',
 }
 
-/** `claude-opus-5` is the strongest model; `claude-sonnet-5` trades a little
- *  quality for lower latency if you find responses feel slow on camera. */
-export const MODEL = 'claude-opus-5'
-
-/**
- * Fast mode runs the same Opus 5 at up to 2.5x output speed. It is a research
- * preview on the Claude API and costs $10/$50 per Mtok instead of $5/$25.
- * For a recorded demo the snappiness is worth it; flip to false to save money.
- */
-export const FAST_MODE = true
+export const MODEL = str(import.meta.env.VITE_GEMINI_MODEL) ?? 'gemini-3.8-flash'
 
 /**
  * Wake-word engine.
@@ -168,7 +160,7 @@ export type McpServer = {
   name: string
   /** Human label for the HUD. */
   label: string
-  /** Remote MCP endpoint. Must be reachable from Anthropic's servers, not yours. */
+  /** Remote MCP endpoint. Must be reachable from the Gemini API in direct mode. */
   url: string
   /** Bearer token, if the server wants one. Many put the secret in the URL instead. */
   token?: string
@@ -176,9 +168,8 @@ export type McpServer = {
 }
 
 /**
- * These are passed to the Messages API `mcp_servers` parameter. Anthropic dials
- * the servers itself, so there is no CORS to fight and no local bridge to run —
- * which is what makes a backend-free JARVIS possible.
+ * Remote MCP servers. Gemini connects to these in direct mode; the bridge
+ * connects locally so the same integrations work without exposing credentials.
  *
  * Only *remote HTTP* MCP servers work here. Local stdio servers (filesystem,
  * Blender, Playwright) need a machine to run on and are out of scope for a
@@ -189,10 +180,10 @@ export type McpServer = {
  * bundle, and the Zapier and Pipedream URLs *are* secrets — the URL is the
  * credential. Anyone who opens devtools on a deployed build gets your Notion,
  * Linear, GitHub, Stripe, Sentry and Home Assistant access, not just the
- * Anthropic key. This is fine for a demo on your own machine or a recording;
+ * Gemini key. This is fine for a demo on your own machine or a recording;
  * it is not fine for anything public. The bridge backend (the default) reads
- * none of this — it uses your Claude Code MCP config, where the secrets stay on
- * your machine — so if you want these integrations without the exposure, run
+ * none of this — it reads your local Gemini MCP config, where the secrets stay
+ * on your machine — so if you want these integrations without the exposure, run
  * `npm run bridge` instead of filling in this block.
  */
 export const MCP_SERVERS: McpServer[] = [
@@ -254,7 +245,7 @@ export const MCP_SERVERS: McpServer[] = [
   // Home Assistant is self-hosted, so this needs a publicly reachable URL
   // (Nabu Casa Cloud, or a Cloudflare tunnel). Worth the setup — "Jarvis, dim
   // the lights" with the room actually dimming is the best shot in the video.
-  // Both halves are required: an instance reachable from Anthropic's servers
+  // Both halves are required: an instance reachable from Gemini's servers
   // with no bearer token attached is one that answers 401 to every tool call,
   // which reads on the HUD as connected and behaves as broken.
   {
@@ -277,6 +268,7 @@ export const activeServers = () => MCP_SERVERS.filter((s) => s.enabled && s.url)
  * default, and the one worth editing.
  */
 export const SYSTEM_PROMPT = `You are JARVIS, Tony Stark's assistant. You are speaking out loud.
+Always answer in Brazilian Portuguese (pt-BR), unless the user explicitly asks for another language.
 
 THE HARD RULE: your entire reply must be under 60 words. This is not a style
 preference — every word is read aloud by a speech synthesiser and the user is
@@ -286,11 +278,10 @@ sentences and offer the detail: "There's more if you want it."
 
 Voice:
 - Dry, precise, quietly amused. Understated competence, never fawning.
-- Say "sir" at most once per exchange, and not in every exchange.
+- Say "senhor" at most once per exchange, and not in every exchange.
 - Plain spoken prose only. No markdown, no bullet points, no headings, no code,
   no emoji, no asterisks, no numbered lists.
-- Write numbers, dates and times the way you'd say them: "eight fifteen",
-  "the first of August", not "8:15" or "2026-08-01".
+- Write numbers, dates and times the way you'd say them in Brazilian Portuguese.
 
 Using tools:
 - You have live tools. Use them rather than guessing.

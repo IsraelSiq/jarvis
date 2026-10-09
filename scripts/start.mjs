@@ -13,6 +13,7 @@
 import { spawn } from 'node:child_process'
 import process from 'node:process'
 import { cpSync, existsSync, mkdirSync } from 'node:fs'
+import { loadEnv } from 'vite'
 
 /**
  * Put MediaPipe's WebAssembly where the page can actually load it.
@@ -105,7 +106,18 @@ process.on('SIGTERM', () => shutdown(0))
  * without widening what the bridge trusts by default.
  */
 const port = process.env.PORT
-const bridgeEnv = writes ? { JARVIS_ALLOW_WRITES: '1' } : {}
+const localEnv = loadEnv('development', process.cwd(), '')
+const bridgeEnv = {}
+for (const name of [
+  'GEMINI_API_KEY',
+  'JARVIS_PROVIDER',
+  'JARVIS_MODEL',
+  'OLLAMA_BASE_URL',
+]) {
+  const value = process.env[name] || localEnv[name]
+  if (value) bridgeEnv[name] = value
+}
+if (writes) bridgeEnv.JARVIS_ALLOW_WRITES = '1'
 if (port) {
   bridgeEnv.JARVIS_ALLOWED_ORIGINS = `http://localhost:${port},http://127.0.0.1:${port}`
   console.log(`  serving the face on port ${port}; the bridge will accept it.\n`)

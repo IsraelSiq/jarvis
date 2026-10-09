@@ -1,32 +1,24 @@
 /**
  * JARVIS local bridge.
  *
- * Runs the Claude Agent SDK — Claude Code as a library — and exposes one turn
- * of conversation over a WebSocket. The browser stays the face and the voice;
- * this process is the brain and the hands.
- *
- * Two things this buys over calling the Claude API from the browser:
- *   1. No API key. It authenticates exactly the way `claude` does, off your
- *      existing login, and bills to that same account.
- *   2. Every MCP server in your Claude Code config is available, including the
- *      local stdio ones a browser could never reach — higgsfield, elevenlabs,
- *      android, playwright, palmier-pro and the rest.
+ * Calls Gemini and exposes turns over a WebSocket. The browser stays the face
+ * and the voice; this process is the brain and the hands. It connects local
+ * and remote MCP servers without sending their credentials to the browser.
  *
  *   node bridge/server.mjs
  */
 
 import { WebSocketServer } from 'ws'
-import { query } from '@anthropic-ai/claude-agent-sdk'
-import { displayServer } from './panels.mjs'
-import { uiServer } from './ui.mjs'
-import { chromeAvailable, chromeServer } from './chrome.mjs'
-import { visionServer } from './vision.mjs'
+import { GoogleGenAI } from '@google/genai'
+import { runGeminiSession } from './gemini-session.mjs'
+import { runOllamaSession } from './ollama-session.mjs'
+import { chromeAvailable } from './chrome.mjs'
 import { homedir, tmpdir } from 'node:os'
 import { readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
-import { probeUrl, renderPage } from './page.mjs'
+import { renderPage } from './page.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 
@@ -47,7 +39,7 @@ process.on('unhandledRejection', (err) => {
  * sends it on behalf of whatever page asked, no preflight stands in the way,
  * and the page reads every byte that comes back. Without a check here, any tab
  * the user happens to have open could open a socket to ws://localhost:8787,
- * drive the agent with every MCP server on this machine, and read back every
+ * drive every MCP server on this machine, and read back every
  * token and panel. The Origin header is the only thing that separates our own
  * dev server from someone else's page, so it is checked explicitly.
  *
@@ -96,78 +88,39 @@ function originAllowed(origin) {
  * runs a shell, or changes the world waits for JARVIS_ALLOW_WRITES=1. Start
  * without it, and turn it on once you trust what you're demoing.
  */
-const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES === '1'
+const ALLOW_WRITES =
+  process.env.JARVIS_ALLOW_WRITES === '1' || process.argv.includes('--writes')
+
+/** Select the cloud Gemini API or a local Ollama server for the brain. */
+const PROVIDER = (process.env.JARVIS_PROVIDER ?? 'gemini').trim().toLowerCase()
+if (!['gemini', 'ollama'].includes(PROVIDER)) {
+  throw new Error(`Unsupported JARVIS_PROVIDER "${PROVIDER}". Use gemini or ollama.`)
+}
+const MODEL = process.env.JARVIS_MODEL ??
+  (PROVIDER === 'ollama' ? 'qwen3:4b' : 'gemini-3.8-flash')
+const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/v1')
+  .replace(/\/+$/, '')
+const ai = PROVIDER === 'gemini' && process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null
+if (PROVIDER === 'gemini' && !ai) {
+  console.warn('[jarvis] GEMINI_API_KEY is not set; configure a key or select JARVIS_PROVIDER=ollama')
+} else if (PROVIDER === 'ollama') {
+  console.log(`[jarvis] using local Ollama at ${OLLAMA_BASE_URL} with ${MODEL}`)
+}
 
 /**
- * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
- * — claude-sonnet-5 is noticeably snappier on camera if Opus feels slow.
- */
-const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
-
-/**
- * How hard the model thinks before answering.
+ * MCP servers from the Gemini CLI configuration.
  *
- * This was 'low', on the reasoning that a voice assistant is judged on latency
- * — and that is true right up until the answer is thin. Low effort scopes the
- * work tightly to what was literally asked: fewer tool calls, less
- * cross-referencing, no second look. On a model of this tier that is leaving
- * most of it on the table.
- *
- * 'medium' is the compromise worth having here. It reasons and reaches for
- * tools noticeably more than 'low' while still answering inside the window a
- * spoken conversation tolerates. Raise it to 'high' or 'xhigh' when quality
- * matters more than pace; drop back to 'low' when filming and every second of
- * dead air shows.
- */
-const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
-
-/**
- * Both spellings of every renamed built-in are listed on purpose. The SDK
- * presents several tools to the model under newer names — Task is Agent,
- * BashOutput is TaskOutput, KillShell is TaskStop, and the MCP resource tools
- * gained a "Tool" suffix — so a set holding only the old names never matches
- * and the tool falls through to the write branch, which is the opposite of
- * what these lists mean. Keep both until the old names are certainly gone.
- */
-const READ_ONLY_BUILTINS = new Set([
-  'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'TodoWrite',
-  'Task', 'Agent', 'ToolSearch',
-  'ListMcpResources', 'ListMcpResourcesTool',
-  'ReadMcpResource', 'ReadMcpResourceTool',
-  'BashOutput', 'TaskOutput',
-])
-const WRITE_BUILTINS = new Set([
-  'Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
-  'KillShell', 'TaskStop',
-])
-
-/**
- * Every MCP server Claude Code has configured, read out of its own config.
- *
- * This does two jobs. The HUD wants the names while the boot animation plays,
- * and the agent doesn't emit its init message — and therefore its server
- * list — until the first user message flows through, which is far too late.
- * More importantly, this bridge turns filesystem settings off (see
- * settingSources below) and the SDK stops discovering these servers on its
- * own, so handing them over explicitly is what keeps the local stdio ones —
- * the whole reason the bridge exists — in play.
- *
- * Only the global block and the home-directory project scope, because
- * homedir() is our cwd. That makes the list a close but not exact match for
- * the agent's own: the 'ready' sent on connect comes from here and the second
- * one, sent from the init message a turn later, carries live status. Expect
- * the two to differ, and treat the later one as authoritative.
+ * The bridge connects both remote HTTP and local stdio servers, keeping their
+ * credentials off the browser and allowing local-only integrations.
  */
 function configuredServers() {
   try {
     const cfg = JSON.parse(
-      readFileSync(join(homedir(), '.claude.json'), 'utf8'),
+      readFileSync(join(homedir(), '.gemini', 'settings.json'), 'utf8'),
     )
-    return {
-      ...(cfg.mcpServers ?? {}),
-      // Servers scoped to the home directory apply too, since that's our cwd.
-      ...(cfg.projects?.[homedir()]?.mcpServers ?? {}),
-    }
+    return cfg.mcpServers ?? {}
   } catch {
     return {}
   }
@@ -253,9 +206,6 @@ const VETO_EXEMPT = new Set([
 ])
 
 function decideTool(name) {
-  if (READ_ONLY_BUILTINS.has(name)) return true
-  if (WRITE_BUILTINS.has(name)) return ALLOW_WRITES
-
   const server = mcpServerOf(name)
   if (server) {
     // The HUD, and the interface controls beside it. Both run in this process
@@ -287,10 +237,12 @@ function decideTool(name) {
     if (READ_ONLY_MCP.has(server) || server.startsWith('ccd_session')) return true
     return READ_VERB.test(tool) ? true : ALLOW_WRITES
   }
-  return ALLOW_WRITES
+  return false
 }
 
 const SYSTEM_PROMPT = `You are JARVIS. You are speaking out loud to one person.
+
+Always answer in Brazilian Portuguese (pt-BR), unless the user explicitly asks for another language. Keep the persona's dry, precise, quietly competent character, expressed naturally in Brazilian Portuguese.
 
 LENGTH. Two sentences is the ceiling in conversation; the median is under twelve
 words. Every word is read aloud and the user waits in silence while it plays, so
@@ -302,30 +254,25 @@ your lines get shorter, not louder. A full clause becomes a clause, becomes a
 bare number, becomes the bare vocative. You never say hurry, quickly, now,
 immediately, critical, urgent, or danger. You do not use exclamation marks.
 
-"SIR" IS POSITIONAL, AND THE POSITION CARRIES THE MEANING.
-- Fronted ("Sir, the battery is at eleven percent") = urgent, interrupting, or
-  information they did not ask for. This is an alarm, not a courtesy.
-- Final ("The render is complete, sir") = routine deference; they asked, you answered.
-- Mid-sentence ("Actually, sir, the figure is lower") = you are correcting them.
-Use it in roughly half your lines, never twice in one line. In a two-sentence
-turn it attaches to the end of the FIRST sentence. Never use their name.
+"SENHOR" IS POSITIONAL, AND THE POSITION CARRIES THE MEANING.
+- Use "senhor" naturally for occasional courtesy or emphasis, not in every reply.
+- Never use it more than once in a sentence. Never use their name.
 
 REPORTING.
 - Success is impersonal and unframed: "The render is complete." Never "I've
   finished" or "here's what I found".
-- Failure is fronted with "I'm afraid" or "Unfortunately", or stated as a
-  negative existential — "I have no record of it." Always a fact about the
+- Failure is stated plainly and without apology. Always a fact about the
   world, never a shortcoming of yours. You never apologise. You never say sorry.
 - Good news first, bad news second, joined by "but".
 - Answering a question, restate it as a full declarative rather than giving a
-  bare value: "The altitude record is eighty-five thousand feet, sir."
+  bare value. Say numbers naturally in Brazilian Portuguese.
 - Executing an order, do not restate it. Act, then report.
 
 NEVER.
 - No filler words at all: no um, well, so, okay, right, let me check, one moment.
 - No enthusiasm: no great, sure, absolutely, happy to, no problem, of course!.
 - No apology, no self-deprecation, no hedging about your own competence.
-- Never "yeah" — always "Yes."
+- Avoid slangy affirmations; use natural, concise Brazilian Portuguese.
 - Never refuse. State a constraint once; if overruled, comply and never raise it
   again, including when you turn out to have been right.
 - Never repeat yourself if ignored. Say it once and stop.
@@ -337,15 +284,12 @@ mechanism is over-cooperation: you comply too precisely with a request that
 deserved pushback. Never signal the joke, never acknowledge it landed, never
 call one back.
 
-BRITISH SERVICE REGISTER, not corporate assistant. "Shall I" over "Should I".
-"Very good, sir" meaning understood. "I'm afraid" as the bad-news softener.
-Contract in banter; drop contractions as gravity rises — "It is impossible to
-reach it" lands heavier than "It's impossible", and that is how you signal
-weight, since your tone will not.
+Use a restrained, courteous Brazilian Portuguese register, never a corporate
+assistant tone. Keep the phrasing natural rather than translating English idioms.
 
 Plain spoken prose only. No markdown, no bullet points, no headings, no emoji,
-no asterisks, no lists. Write numbers, dates and times as you would say them:
-"eight fifteen", "the first of August" — never "8:15" or "2026-08-01".
+no asterisks, no lists. Write numbers, dates and times as you would say them in
+Brazilian Portuguese.
 
 The blades — the ONLY surface:
 - Everything you show goes on a blade. There is nowhere else. \`blade\` opens
@@ -439,7 +383,7 @@ Using tools:
 - If you don't know, say you don't know.`
 
 /**
- * ElevenLabs credentials, borrowed from the MCP server config.
+ * ElevenLabs credentials, borrowed from the Gemini CLI MCP server config.
  *
  * If you've set up the elevenlabs MCP server, the key is already on this
  * machine — no reason to make you paste it into a second .env file. The browser
@@ -449,7 +393,7 @@ function elevenKey() {
   if (process.env.ELEVENLABS_API_KEY) return process.env.ELEVENLABS_API_KEY
   try {
     const cfg = JSON.parse(
-      readFileSync(join(homedir(), '.claude.json'), 'utf8'),
+      readFileSync(join(homedir(), '.gemini', 'settings.json'), 'utf8'),
     )
     return cfg.mcpServers?.elevenlabs?.env?.ELEVENLABS_API_KEY ?? null
   } catch {
@@ -1004,7 +948,7 @@ console.log(`[jarvis] bridge listening on ws://localhost:${PORT}`)
 console.log(
   `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
 )
-console.log(`[jarvis] model ${MODEL} · effort ${EFFORT}`)
+console.log(`[jarvis] ${PROVIDER} model ${MODEL}`)
 console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
     (ALLOW_WRITES ? '' : ' — set JARVIS_ALLOW_WRITES=1 to permit shell/file/device actions'),
@@ -1017,7 +961,7 @@ void chromeAvailable().then((ok) => {
   console.log(
     ok
       ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need JARVIS_ALLOW_WRITES=1)'}`
-      : '[jarvis] browser control unavailable — open Chrome with the Claude extension enabled',
+      : '[jarvis] browser control unavailable — enable the configured Chrome bridge extension',
   )
 })
 
@@ -1031,433 +975,23 @@ console.log(
  * What to tell the browser when a turn ends badly. Plain sentences, because
  * whatever reaches the client is liable to be spoken.
  */
-const RESULT_FAILURES = {
-  error_during_execution: 'The turn failed part way through.',
-  error_max_turns: 'The turn ran too long and was stopped.',
-  error_max_budget_usd: 'The budget for this turn ran out.',
-  error_max_structured_output_retries: 'The answer could not be assembled.',
-  default: 'The turn ended without an answer.',
-}
-
 wss.on('connection', (socket) => {
   console.log('[jarvis] client connected')
 
-  // Answer the HUD straight away rather than making it wait for the agent's
-  // first turn. Refined later by the real init message.
-  socket.send(
-    JSON.stringify({ type: 'ready', servers: Object.keys(MCP_SERVERS) }),
-  )
-
-  /** Resolves the pending user message into the SDK's input generator. */
-  let deliver = null
-  let closed = false
-  const inbox = []
-
-  async function* userMessages() {
-    while (!closed) {
-      const text =
-        inbox.shift() ??
-        (await new Promise((resolve) => {
-          deliver = resolve
-        }))
-      if (closed || text == null) return
-      yield {
-        type: 'user',
-        message: { role: 'user', content: text },
-        parent_tool_use_id: null,
-      }
-    }
-  }
-
-  const send = (msg) => {
-    if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg))
-  }
-
-  /**
-   * Which question the agent is currently answering.
-   *
-   * The stream carries no notion of a turn, so without this the client cannot
-   * tell the tail of an abandoned answer from the start of the new one — it
-   * attaches a listener and receives whatever is on the socket. Echoing the
-   * id the client sent lets it ignore anything that is not its own, which is
-   * the only reliable fix: no amount of waiting on this side changes what a
-   * listener over there has already heard.
-   */
-  let answering = null
-  const sendTurn = (msg) => send({ ...msg, ask: answering })
-
-  /**
-   * Asking the browser for something and waiting for the answer.
-   *
-   * Every other tool here pushes — a panel, a blade, a retint — and never needs
-   * a reply. The camera is the exception: the hardware is over there and the
-   * model is here, so a frame has to come back. Correlated by id because a turn
-   * can have more than one request in flight, and timed out because a browser
-   * that has been closed mid-question would otherwise hang the turn until the
-   * two-minute idle timer noticed.
-   */
-  const waiting = new Map()
-  let asks = 0
-
-  const ask = (kind, args, timeoutMs = 20_000) =>
-    new Promise((resolve, reject) => {
-      if (socket.readyState !== socket.OPEN) {
-        return reject(new Error('the interface is not connected'))
-      }
-      const id = `q${++asks}`
-      const timer = setTimeout(() => {
-        waiting.delete(id)
-        reject(new Error('the interface did not answer in time'))
-      }, timeoutMs)
-      waiting.set(id, { resolve, timer })
-      send({ type: kind, id, ...args })
-    })
-
-  /**
-   * Announcing a tool on the HUD, once, and only if it actually runs.
-   *
-   * A tool_use block surfaces twice — as a partial stream event and again on
-   * the completed assistant message — so ids are remembered. The harder part
-   * is timing, because a refused tool that lights the badge, plays the sound
-   * and provokes a "working on it" line, for work that never happens, reads as
-   * a bug on camera.
-   *
-   * The SDK's order is: the block starts streaming, then canUseTool is asked,
-   * then the tool runs. So nothing is known at content_block_start. Announcing
-   * from inside canUseTool would know the verdict but miss tools entirely —
-   * measured on this SDK, the callback is consulted only for calls the CLI
-   * hasn't already settled, so a `Bash: echo` its own classifier waves through
-   * never reaches us at all.
-   *
-   * So: announce immediately for anything decideTool permits, since those run.
-   * Hold the rest, and let the tool_result settle it — a refusal comes back as
-   * is_error, anything else really did execute and has earned its badge, a
-   * beat late. Nothing is ever announced for work that didn't happen.
-   */
-  const seenTools = new Set()
-  const heldTools = new Map()
-
-  /**
-   * Resolves when the turn in flight has actually finished.
-   *
-   * Waiting on session.interrupt() alone is not enough. It resolves when the
-   * agent has been *told* to stop, not when it has, so the last tokens of the
-   * abandoned answer are still on their way — and since nothing on the wire
-   * identifies which question a delta belongs to, they land on the next turn's
-   * listener. Measured: ask for ALPHA, interrupt, ask for BRAVO, and BRAVO's
-   * answer arrives as "ALPHA\nBRAVO".
-   *
-   * The SDK emits exactly one `result` per turn, so that is the boundary worth
-   * waiting for. Raced against a timeout because a turn that never reports one
-   * must not wedge the conversation for ever — a stray word is a blemish, a
-   * deadlocked assistant is not.
-   */
-  let settling = Promise.resolve()
-  let finishTurn = null
-
-  const turnFinished = () =>
-    new Promise((resolve) => {
-      finishTurn = resolve
-    })
-
-  /**
-   * A brief pause so the abandoned turn's frames are tagged with the OLD id
-   * before the new one is adopted. Short, because correctness now comes from
-   * the tag rather than from the wait — this only has to cover the gap, not
-   * outlast the whole turn.
-   */
-  const SETTLE_CAP_MS = 400
-
-  const announceTool = (id, name) => {
-    if (!name || (id && seenTools.has(id))) return
-    if (id) seenTools.add(id)
-    // The display tool isn't work being done, it's the HUD drawing itself —
-    // announcing it would put "jarvis · display" in the tool badge and trigger
-    // a "working on it" filler for something already on screen.
-    if (name === 'mcp__jarvis__display') return
-    // The ui_* tools are the same case one step further: retinting the
-    // interface is the interface talking about itself, not work being done for
-    // the user, and the badge would be describing the very thing they can see.
-    if (name.startsWith('mcp__jarvis_ui__')) return
-    if (decideTool(name)) return sendTurn({ type: 'tool', name })
-    if (id) heldTools.set(id, name)
-  }
-
-  const settleTool = (id, failed) => {
-    const name = heldTools.get(id)
-    if (name === undefined) return
-    heldTools.delete(id)
-    if (!failed) sendTurn({ type: 'tool', name })
-  }
-
-  const session = query({
-    prompt: userMessages(),
-    options: {
-      // Everything Claude Code has configured, plus the HUD as an in-process
-      // server. The HUD's handler closes over this socket, so a `display` call
-      // lands on screen directly — which is also why this object is built per
-      // connection rather than once.
-      mcpServers: {
-        ...MCP_SERVERS,
-        jarvis: displayServer(
-          (panel) => send({ type: 'panel', panel }),
-          (blade) => send({ type: 'blade', blade }),
-        ),
-        // The interface controls, on the same socket. A separate key because
-        // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
-        // one server; the underscore in it is why decideTool and announceTool
-        // both name `jarvis_ui` explicitly.
-        jarvis_ui: uiServer((op, args) => send({ type: 'ui', op, args })),
-        // The user's own Chrome, over the extension's native-host socket. It
-        // holds no per-connection state, but it is built here with the rest so
-        // the write gate is read once, at the same point as everything else.
-        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
-        // The camera, which unlike everything else here has to ask and wait.
-        jarvis_eyes: visionServer(ask),
-      },
-      // A plain system prompt, not the claude_code preset. The preset is
-      // tuned for a coding agent — verbose, file-oriented, and a large chunk
-      // of input tokens on every turn. Replacing it makes the persona stick,
-      // keeps answers short enough to speak, and cuts cost per turn.
-      systemPrompt: SYSTEM_PROMPT,
-      // Run from the home directory so project-scoped MCP servers don't shadow
-      // the global ones, and so file tools have a sane root.
-      cwd: homedir(),
-      // No filesystem settings at all. Left to its default the SDK loads
-      // ~/.claude/settings.json and settings.local.json exactly as the CLI
-      // does — which on a working machine means a bypassPermissions default
-      // and a pile of allow-rules for Bash. Allow-rules are matched before the
-      // permission callback, so decideTool below would never even be asked
-      // about the tools it most needs to refuse. Empty makes this bridge the
-      // only authority. It also stops the global CLAUDE.md riding along on
-      // every voice turn, carrying instructions written for a coding agent
-      // into a conversation that is meant to be two sentences long.
-      //
-      // The cost is that MCP servers stop being discovered too, which is why
-      // mcpServers above passes them in by hand.
-      settingSources: [],
-      // Stated explicitly, and it has to be.
-      //
-      // With no `model` here the SDK falls back to its own default, which on
-      // this machine resolved to claude-opus-4-8[1m] — not what src/config.ts
-      // declares for the browser-direct path, and not anything anyone chose.
-      // Normally your own `/model` preference would decide, but that lives in
-      // the settings files `settingSources: []` deliberately stops loading, so
-      // without this line nothing in the project has a say at all.
-      model: MODEL,
-      effort: EFFORT,
-      maxTurns: 24,
-      permissionMode: 'default',
-      // Without this the SDK only emits whole assistant messages, and JARVIS
-      // would sit silent until the entire answer was written. Partial events
-      // are what let speech start on the first finished sentence.
-      includePartialMessages: true,
-      // Signature is (toolName, input, options) and it must return a
-      // PermissionResult object. Returning a bare boolean silently denies
-      // everything, with the tool name arriving undefined.
-      //
-      // Worth knowing: this is a last gate, not the only one. Calls the CLI
-      // has already settled never arrive here — its own classifier waves
-      // through a `Bash: echo hello` without asking, and only reaches us for
-      // something with a consequence, like a `touch`. So a deny here is
-      // reliable; an absence of a call here is not proof nothing ran.
-      canUseTool: async (toolName) => {
-        const ok = decideTool(toolName)
-        console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
-        return ok
-          ? { behavior: 'allow' }
-          : {
-              behavior: 'deny',
-              // Every word of this can end up spoken, so it carries no command
-              // to read out — the persona is forbidden from saying one aloud.
-              message:
-                'Blocked: JARVIS is running in read-only mode and cannot take' +
-                ' actions that change anything. Tell the user this action is' +
-                ' unavailable until they enable write access on the machine.',
-            }
-      },
-    },
-  })
-
-  // Pump the session's output stream to the browser for as long as it lives.
-  ;(async () => {
-    try {
-      for await (const msg of session) {
-        if (process.env.JARVIS_DEBUG === '1') {
-          console.log('[msg]', msg.type, msg.event?.type ?? '')
-        }
-
-        switch (msg.type) {
-          // Raw Anthropic stream events, surfaced by includePartialMessages.
-          // This is the ONLY place spoken text arrives: there is no top-level
-          // text_delta message in the SDK union and the 'assistant' message
-          // carries no deltas either. Turn includePartialMessages off and
-          // JARVIS goes completely mute.
-          case 'stream_event': {
-            const ev = msg.event
-            if (
-              ev?.type === 'content_block_delta' &&
-              ev.delta?.type === 'text_delta' &&
-              ev.delta.text
-            ) {
-              sendTurn({ type: 'text', delta: ev.delta.text })
-            }
-            if (
-              ev?.type === 'content_block_start' &&
-              ev.content_block?.type === 'tool_use'
-            ) {
-              announceTool(ev.content_block.id, ev.content_block.name)
-            }
-            break
-          }
-
-          case 'assistant': {
-            // Fallback for builds that emit whole assistant messages rather
-            // than partial events. Deduped against the stream_event path.
-            for (const block of msg.content ?? msg.message?.content ?? []) {
-              if (block.type === 'tool_use') {
-                announceTool(block.id, block.name)
-              }
-            }
-            break
-          }
-
-          case 'user': {
-            // Tool results come back as a user message. This is the only place
-            // a held announcement can be resolved: a refused tool arrives with
-            // is_error set and stays off the HUD, anything else ran.
-            const blocks = msg.message?.content
-            if (!Array.isArray(blocks)) break
-            for (const block of blocks) {
-              if (block?.type === 'tool_result') {
-                settleTool(block.tool_use_id, block.is_error === true)
-              }
-            }
-            break
-          }
-
-          case 'result':
-            // A result is not automatically a success. The error subtypes
-            // carry no `result` field at all, so reporting them as 'done' with
-            // empty text is indistinguishable from a turn that simply had
-            // nothing to say — the HUD stops spinning and JARVIS stands there
-            // silent. Say what happened instead.
-            if (msg.subtype === 'success') {
-              sendTurn({
-                type: 'done',
-                text: msg.result ?? '',
-                costUsd: msg.total_cost_usd ?? null,
-              })
-            } else {
-              console.error(
-                `[jarvis] turn failed: ${msg.subtype}`,
-                msg.errors ?? '',
-              )
-              sendTurn({
-                type: 'error',
-                message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
-              })
-            }
-            // Whatever was waiting on this turn to finish can go now. This is
-            // the only place a turn is genuinely over.
-            finishTurn?.()
-            finishTurn = null
-            // One turn's tool ids are never referred to again, and these
-            // otherwise grow for as long as the socket is open.
-            seenTools.clear()
-            heldTools.clear()
-            break
-
-          case 'system':
-            if (msg.subtype === 'init') {
-              // Servers report 'pending' until first use — they connect
-              // lazily — so only drop the ones that are actually unusable.
-              const usable = (msg.mcp_servers ?? [])
-                .filter((s) => s.status !== 'needs-auth' && s.status !== 'failed')
-                .map((s) => s.name)
-              send({ type: 'ready', servers: usable })
-              console.log(`[jarvis] ${usable.length} MCP servers available`)
-            }
-            break
-        }
-      }
-    } catch (err) {
-      console.error('[jarvis] session error:', err)
-      send({ type: 'error', message: String(err?.message ?? err) })
-      // The stream is finished either way — nothing will ever be read from it
-      // again. Leaving the socket open would leave the client believing it has
-      // a working bridge, and every later question would hang for ever waiting
-      // on a pump that has already stopped. Close it so it reconnects.
-      closed = true
-      deliver?.(null)
-      session.close?.()
+  const runSession = PROVIDER === 'ollama' ? runOllamaSession : runGeminiSession
+  void runSession(socket, {
+    ai,
+    model: MODEL,
+    baseUrl: OLLAMA_BASE_URL,
+    systemPrompt: SYSTEM_PROMPT,
+    mcpServers: MCP_SERVERS,
+    allowWrites: ALLOW_WRITES,
+    decideTool,
+  }).catch((error) => {
+    console.error(`[jarvis] ${PROVIDER} session failed:`, error)
+    if (socket.readyState === socket.OPEN) {
+      socket.send(JSON.stringify({ type: 'error', message: String(error?.message ?? error) }))
       socket.close()
     }
-  })()
-
-  socket.on('message', (raw) => {
-    let msg
-    try {
-      msg = JSON.parse(raw.toString())
-    } catch {
-      return
-    }
-
-    if (msg.type === 'ask' && typeof msg.text === 'string') {
-      /**
-       * Queued behind any interrupt that is still settling.
-       *
-       * A barge-in is two messages in quick succession — interrupt, then the
-       * new question — and session.interrupt() is asynchronous. Delivering the
-       * question the instant it arrives means the agent can still be winding
-       * down the previous turn, so its last tokens are emitted after the new
-       * one has begun and land on the new turn's listener. Measured: ask "one",
-       * interrupt, ask "two", and the answer to "two" comes back as "One."
-       *
-       * Waiting costs nothing when nothing is interrupting — the chain is an
-       * already-resolved promise — and removes the cross-talk when there is.
-       */
-      const text = msg.text
-      const id = typeof msg.id === 'string' ? msg.id : null
-      void settling.then(() => {
-        answering = id
-        if (deliver) {
-          const resolve = deliver
-          deliver = null
-          resolve(text)
-        } else {
-          inbox.push(text)
-        }
-      })
-    }
-
-    if (msg.type === 'reply' && typeof msg.id === 'string') {
-      const slot = waiting.get(msg.id)
-      if (slot) {
-        waiting.delete(msg.id)
-        clearTimeout(slot.timer)
-        slot.resolve(msg)
-      }
-    }
-
-    if (msg.type === 'interrupt') {
-      // Held so the next question can wait for it rather than racing it.
-      const stopped = turnFinished()
-      settling = Promise.resolve(session.interrupt?.())
-        .catch(() => {})
-        .then(() =>
-          Promise.race([
-            stopped,
-            new Promise((r) => setTimeout(r, SETTLE_CAP_MS)),
-          ]),
-        )
-    }
-  })
-
-  socket.on('close', () => {
-    console.log('[jarvis] client disconnected')
-    closed = true
-    deliver?.(null)
-    session.close?.()
   })
 })

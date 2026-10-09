@@ -3,13 +3,11 @@
 A browser voice assistant with an Iron Man holographic interface. Say
 **"Hey Jarvis"**, he wakes, listens, and does real things through your tools —
 searches the web, generates images, drives your phone, reads your mail. The face
-is a web page (React + Vite + Three.js + custom GLSL). The brain is Claude Code,
-run headless as a library.
+is a web page (React + Vite + Three.js + custom GLSL). Gemini powers the brain;
+a local Node bridge connects it to your MCP tools.
 
-**The only subscription you need is Claude Code.** No API keys, no OpenAI
-account, no cloud bill — the brain runs on your existing Claude Code login, and
-the heavy work (the model itself) runs on Anthropic's servers, so even a low-end
-laptop only has to draw the interface. **ElevenLabs is an optional add-on** that
+**Choose a brain:** use Gemini with an API key, or run Ollama locally without a
+cloud key. **ElevenLabs is an optional add-on** that
 gives JARVIS a much better voice and sharper hearing; without it he speaks and
 listens through the browser's own speech, and everything still works.
 
@@ -17,19 +15,19 @@ listens through the browser's own speech, and everything still works.
 
 ## Requirements
 
-**In one line:** a Claude Code subscription, plus two free things every computer
-can have — Node.js and Chrome. That's the whole list.
+**In one line:** Node.js and Chrome, plus either a Gemini API key or Ollama.
 
-- **Claude Code, installed and logged in** — this is the only account you need.
-  Install it with the official method — `npm install -g @anthropic-ai/claude-code`,
-  or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
-  then run `claude` once and complete login. The bridge reuses that login. **No
-  API key**, and usage is billed to your existing Claude account.
+- **Gemini (cloud)** — create a key at <https://aistudio.google.com/apikey> and
+  set `GEMINI_API_KEY` in `.env.local` for `npm start`, or in the shell when
+  running `npm run bridge` separately.
+- **Ollama (local)** — install it from <https://ollama.com/download>, then run
+  `ollama pull qwen3:4b`. Set `JARVIS_PROVIDER=ollama` in `.env.local` to use
+  the local model; no Gemini key is required.
 - **Node.js 20 or newer** — free, one installer from <https://nodejs.org>. This
   is a Node web app, so it is the one unavoidable tool.
 - **Google Chrome or Microsoft Edge**, in a **real browser window** — not an
-  embedded preview pane. Preview panes (including the one inside editors and
-  Claude Code) block microphone access, so the page loads and looks right but
+  embedded preview pane. Preview panes (including the one inside editors) block
+  microphone access, so the page loads and looks right but
   never hears you. JARVIS also needs WebGL, which these browsers provide.
 - **Optional: an ElevenLabs API key** — a good add-on, not a requirement. It
   gives a better voice and sharper transcription; the free tier is plenty for a
@@ -90,27 +88,25 @@ the brain and the hands.
 ```
   ┌─ browser (the face) ───────────────┐        ┌─ bridge (the brain) ─────────────┐
   │  "Hey Jarvis" wake word            │        │  Node · bridge/server.mjs        │
-  │  local VAD  →  speech to text      │   ws   │  Claude Agent SDK                │
-  │  reactor UI (Three.js + GLSL)      │◄─────► │   = Claude Code, headless        │
+  │  local VAD  →  speech to text      │   ws   │  Gemini API + MCP clients        │
+  │  reactor UI (Three.js + GLSL)      │◄─────► │   local Gemini bridge            │
   │  text to speech                    │  8787  │  spawns your MCP servers         │
   │  heads-up display                  │        │  permission gate (decideTool)    │
   └────────────────────────────────────┘        └──────────────────────────────────┘
 ```
 
 Everything you see and hear happens in the browser. The bridge is a single Node
-process (`bridge/server.mjs`) that runs the **Claude Agent SDK**
-(`@anthropic-ai/claude-agent-sdk`) — this spawns the real `claude` CLI as a child
-process, so **the brain literally is Claude Code, headless.** They talk over a
-WebSocket (plus a few HTTP endpoints) on `ws://localhost:8787`.
+process (`bridge/server.mjs`) that calls the Gemini API and connects MCP servers
+over stdio, Streamable HTTP or SSE. They talk over a WebSocket (plus a few HTTP
+endpoints) on `ws://localhost:8787`.
 
 **Why a bridge at all?** A browser tab cannot spawn the local stdio MCP servers —
 `higgsfield`, `elevenlabs`, `android`, `playwright`, `exa`, `serper`, and the
-rest. The bridge can. And because it is the Agent SDK, it authenticates off your
-existing Claude Code login: no API key, billed to that same Claude account.
+rest. The bridge connects them locally, while Gemini handles reasoning and
+function calling. MCP servers are read from `~/.gemini/settings.json`.
 
-**The model.** `claude-opus-5` at effort `medium` by default. Override with the
-`JARVIS_MODEL` and `JARVIS_EFFORT` environment variables. On startup the bridge
-prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
+**The model.** Gemini uses `gemini-3.8-flash` by default; Ollama uses
+`qwen3:4b`. Override either with `JARVIS_MODEL`.
 
 ### The voice pipeline
 
@@ -139,19 +135,25 @@ ElevenLabs key) once at boot and picks the engines.
 
 ## What JARVIS can do
 
-Beyond answering, JARVIS reaches every MCP server in your Claude Code
-configuration, and can drive his own interface.
+Beyond answering, JARVIS reaches MCP servers from your Gemini CLI configuration
+and can drive his own interface.
 
 ### Your tools
 
-Every server in your `~/.claude.json` is handed to the SDK explicitly. Depending
-on what you have installed, that is roughly:
+Every server in `~/.gemini/settings.json` is connected by the local bridge.
+Depending on what you have installed, that is roughly:
 
 - **Web & search** — `exa`, `serper`, `serpapi`
 - **Images & video** — `higgsfield`, `openrouter-image`, `palmier-pro`
 - **Voice** — `elevenlabs`
 - **Your phone** — `android`
 - **The browser** — `playwright`
+
+The built-in `chrome_*` adapter still uses the Claude for Chrome extension's
+local native host as a transport; its model-based element finder is disabled,
+and Gemini handles page reading and tool decisions. Install the extension only
+if you need this browser-control integration. Other browser MCP servers can be
+configured in `~/.gemini/settings.json` instead.
 
 A few things you can say:
 
@@ -160,9 +162,8 @@ A few things you can say:
 - *"Take a screenshot of my phone."*
 - *"Open my GitHub notifications."*
 
-> **Note on account connectors.** Servers you added through your **claude.ai
-> account** are not stored on disk, so the bridge cannot see them — it works from
-> the servers in `~/.claude.json` (about 14), not the claude.ai ones.
+> Direct mode only supports remote HTTP MCP servers. The bridge is required for
+> local stdio servers and keeps MCP credentials out of the browser.
 
 ### JARVIS controls the interface
 
@@ -217,16 +218,19 @@ then the triangular arc reactor lighting up — with a start-up sound under it
 
 ## Configuration
 
-Everything is optional in bridge mode. Frontend settings live in `.env.local`
-(copy `.env.example`); bridge settings are environment variables.
+Frontend settings live in `.env.local` (copy `.env.example`); `npm start` passes
+bridge settings from there. Gemini requires `GEMINI_API_KEY`; Ollama runs locally
+without a cloud key.
 
 ### Bridge
 
 | Variable | Default | Effect |
 |---|---|---|
+| `JARVIS_PROVIDER` | `gemini` | `gemini` or `ollama` for bridge mode |
 | `JARVIS_BRIDGE_PORT` | `8787` | Port for the WebSocket + HTTP endpoints |
-| `JARVIS_MODEL` | `claude-opus-5` | Model to run |
-| `JARVIS_EFFORT` | `medium` | Reasoning effort |
+| `GEMINI_API_KEY` | required for Gemini | Gemini API key; not used by Ollama |
+| `JARVIS_MODEL` | provider default | Gemini: `gemini-3.8-flash`; Ollama: `qwen3:4b` |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Ollama's OpenAI-compatible API |
 | `JARVIS_ALLOW_WRITES` | off | `1` allows effectful tools (see below) |
 | `JARVIS_ALLOWED_ORIGINS` | local dev | Extra WebSocket origins to accept |
 | `JARVIS_ALLOW_NO_ORIGIN` | off | Accept connections with no `Origin` header |
@@ -243,14 +247,15 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `VITE_TTS_ENGINE` | `system` or `kokoro` |
 | `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
 | `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
-| `VITE_ANTHROPIC_API_KEY` | Direct mode only |
+| `VITE_GEMINI_API_KEY` | Direct mode only; exposed in the browser bundle |
+| `VITE_GEMINI_MODEL` | Gemini model override for direct mode |
 
 ### Adding an ElevenLabs key
 
 You do not have to touch a flag. Either:
 
 - Set `ELEVENLABS_API_KEY` on the bridge before starting it, **or**
-- Add the key to your `elevenlabs` MCP server's env in `~/.claude.json` — the
+- Add the key to your `elevenlabs` MCP server's env in `~/.gemini/settings.json` — the
   bridge reads it from there too.
 
 Either way, `/health` starts reporting the capability, the browser picks it up on
@@ -263,9 +268,9 @@ the next boot, and both the voice and transcription upgrade automatically.
 The tool gate starts **read-only**. Search, generation and lookups run freely;
 anything effectful — send, tap, delete, install, pay — is denied. Voice is a poor
 interface for a confirmation dialog, so the decision is made ahead of time in
-`decideTool()` in `bridge/server.mjs`, not at the moment of use. The bridge sets
-`settingSources: []`, which makes its own gate the only authority — filesystem
-settings and any global `bypassPermissions` cannot override it.
+`decideTool()` in `bridge/server.mjs`, not at the moment of use. The bridge
+applies this gate itself before every MCP call; provider-side permissions do
+not override it.
 
 To allow effectful tools (phone, browser driving, sending), run the bridge this
 way instead:

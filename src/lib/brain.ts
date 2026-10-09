@@ -1,7 +1,7 @@
 import { BACKEND } from '../config'
-import * as direct from './anthropic'
+import * as direct from './gemini'
 import * as bridge from './bridge'
-import type { AskHandlers, Msg } from './anthropic'
+import type { AskHandlers, Msg } from './gemini'
 import type { Blade, Panel } from '../store'
 
 export type { AskHandlers, Msg }
@@ -11,13 +11,12 @@ export type { ConnectionState } from './bridge'
  * Picks the brain. Both backends answer a question and stream text and tool
  * events back; they differ in where they run and what they can reach.
  *
- *   bridge — a local Node process running the Claude Agent SDK. Uses your
- *            existing Claude Code login, so no API key, and every MCP server
- *            you have configured is available, including local stdio ones.
+ *   bridge — a local Gemini process. Its API key stays on the machine and it
+ *            can connect configured remote and local stdio MCP servers.
  *
- *   direct — the browser calls the Claude API itself. No process to run and it
- *            deploys as a static site, but it needs an API key in the bundle
- *            and can only use remote HTTP MCP servers.
+ *   direct — the browser calls Gemini itself. No process to run and it deploys
+ *            as a static site, but it exposes an API key in the bundle and can
+ *            only use remote HTTP MCP servers.
  */
 
 export const usingBridge = BACKEND === 'bridge'

@@ -1,4 +1,4 @@
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
+import { createSdkMcpServer, tool } from './mcp-tools.mjs'
 import { z } from 'zod'
 import { createConnection } from 'node:net'
 import { readdir, stat } from 'node:fs/promises'
@@ -647,20 +647,6 @@ export function chromeServer({ allowWrites }) {
     ),
 
     tool(
-      'chrome_find',
-      'Find an element by describing it in plain words, e.g. "the search box". ' +
-        'This one runs a model inside the extension, so some Claude accounts ' +
-        'cannot use it at all and it fails with a permission error. When that ' +
-        'happens do not retry it — use chrome_read_page, which returns the same ' +
-        'refs by reading the page directly and always works.',
-      {
-        query: z.string().describe('What to look for, described naturally.'),
-        tabId,
-      },
-      forward('find'),
-    ),
-
-    tool(
       'chrome_screenshot',
       'Take a picture of what is on the page right now. Use it when the ' +
         'answer is visual, or when the user asks what something looks like — ' +
@@ -729,7 +715,7 @@ export function chromeServer({ allowWrites }) {
       tool(
         'chrome_click',
         'Click something on the page. Take the ref from chrome_read_page or ' +
-          'chrome_find rather than guessing coordinates. Say what you are ' +
+          'chrome_read_page rather than guessing coordinates. Say what you are ' +
           'about to do before doing anything irreversible.',
         {
           ref: z.string().optional().catch(undefined).describe('A ref_N from chrome_read_page.'),
